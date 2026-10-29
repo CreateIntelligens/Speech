@@ -19,7 +19,11 @@ import pytest
 
 pytest.importorskip("vllm_omni")
 
-from easymagpie_vllm_omni.pipeline import EASYMAGPIE_LM_PIPELINE, EASYMAGPIE_PIPELINE  # noqa: E402
+from easymagpie_vllm_omni.pipeline import (  # noqa: E402
+    EASYMAGPIE_CFG_PAIRING_PIPELINE,
+    EASYMAGPIE_LM_PIPELINE,
+    EASYMAGPIE_PIPELINE,
+)
 
 
 def test_lm_pipeline_is_single_stage():
@@ -40,3 +44,72 @@ def test_two_stage_pipeline_unchanged():
     assert len(EASYMAGPIE_PIPELINE.stages) == 2
     assert EASYMAGPIE_PIPELINE.stages[1].final_output is True
     assert EASYMAGPIE_PIPELINE.stages[1].final_output_type == "audio"
+
+
+def test_cfg_pairing_pipeline_requires_explicit_selection_and_keeps_standard_pipeline():
+    probe = EASYMAGPIE_CFG_PAIRING_PIPELINE
+    assert probe.model_type == "easymagpie_cfg_pairing"
+    assert probe.hf_architectures == ()
+    assert probe.validate() == []
+    assert probe.stages[0].scheduler_cls == "easymagpie_vllm_omni.cfg_scheduler.EasyMagpieCFGPairingScheduler"
+    assert probe.stages[1] == EASYMAGPIE_PIPELINE.stages[1]
+    assert EASYMAGPIE_PIPELINE.stages[0].scheduler_cls.endswith(".EasyMagpieARAsyncScheduler")
+
+
+def test_cfg_deployment_preserves_dedicated_pipeline_scheduler():
+    from conftest import EASYMAGPIE_ROOT
+    from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+    deploy = load_deploy_config(EASYMAGPIE_ROOT / "deploy" / "easymagpie_cfg_pairing.yaml")
+    stages = merge_pipeline_deploy(EASYMAGPIE_CFG_PAIRING_PIPELINE, deploy)
+    assert stages[0].scheduler_cls == "easymagpie_vllm_omni.cfg_scheduler.EasyMagpieCFGPairingScheduler"
+    stage_args = stages[0].yaml_engine_args
+    assert stage_args["max_num_seqs"] == 2
+    assert stage_args["enforce_eager"] is True
+    assert stage_args["async_scheduling"] is False
+    assert stage_args["enable_chunked_prefill"] is False
+
+
+def test_cfg_synthesis_deployment_uses_same_conservative_paired_execution():
+    from conftest import EASYMAGPIE_ROOT
+    from easymagpie_vllm_omni.pipeline import EASYMAGPIE_CFG_PIPELINE
+    from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+    deploy = load_deploy_config(EASYMAGPIE_ROOT / "deploy" / "easymagpie_cfg.yaml")
+    assert deploy.pipeline == "easymagpie_cfg"
+    assert EASYMAGPIE_CFG_PIPELINE.validate() == []
+    stages = merge_pipeline_deploy(EASYMAGPIE_CFG_PIPELINE, deploy)
+    assert stages[0].scheduler_cls.endswith(".EasyMagpieCFGScheduler")
+    assert stages[0].yaml_engine_args["max_num_seqs"] == 2
+
+
+def test_concurrent_cfg_profile_counts_physical_sequences_and_keeps_conservative_execution():
+    from conftest import EASYMAGPIE_ROOT
+    from easymagpie_vllm_omni.pipeline import EASYMAGPIE_CFG_PIPELINE
+    from vllm_omni.config.stage_config import load_deploy_config, merge_pipeline_deploy
+
+    deploy = load_deploy_config(EASYMAGPIE_ROOT / 'deploy' / 'easymagpie_cfg_concurrent.yaml')
+    stages = merge_pipeline_deploy(EASYMAGPIE_CFG_PIPELINE, deploy)
+    assert stages[0].scheduler_cls.endswith('.EasyMagpieCFGScheduler')
+    assert stages[0].yaml_engine_args['max_num_seqs'] == 6
+    assert stages[1].yaml_engine_args['max_num_seqs'] == 4
+    for stage in stages:
+        args = stage.yaml_engine_args
+        assert args['enforce_eager'] is True
+        assert args['async_scheduling'] is False
+        assert args['enable_prefix_caching'] is False
+        assert args['enable_chunked_prefill'] is False
+
+
+@pytest.mark.parametrize(
+    "profile", ["easymagpie_cfg.yaml", "easymagpie_cfg_pairing.yaml", "easymagpie_cfg_concurrent.yaml"]
+)
+def test_cfg_codec_history_fits_full_acoustic_generation(profile):
+    import yaml
+    from conftest import EASYMAGPIE_ROOT
+
+    config = yaml.safe_load((EASYMAGPIE_ROOT / "deploy" / profile).read_text())
+    acoustic, codec = config["stages"]
+    # Omni's generation runner stores the cumulative codec prompt in InputBatch,
+    # even though each forward consumes only the next small streaming chunk.
+    assert codec["max_model_len"] >= acoustic["default_sampling_params"]["max_tokens"]

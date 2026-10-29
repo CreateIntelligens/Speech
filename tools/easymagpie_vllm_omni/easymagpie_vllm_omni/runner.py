@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+from easymagpie_vllm_omni.cfg_pairing import build_cfg_pairing_layout, is_cfg_hidden_id
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.worker import gpu_ar_worker
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
@@ -65,6 +66,36 @@ def merge_streaming_additional_information(
 
 class EasyMagpieGPUARModelRunner(GPUARModelRunner):
     """GPU AR runner that restores streaming chunk metadata propagation."""
+
+    def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
+        result = super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+        # Input preparation may reorder requests. Build the mapping afterwards,
+        # before forward, using unpadded physical rows and absolute positions.
+        request_ids = self.input_batch.req_ids
+        if not any(is_cfg_hidden_id(rid) for rid in request_ids):
+            if hasattr(self.model, "cfg_pairing_layout"):
+                self.model.cfg_pairing_layout = None
+                self.model.cfg_guidance_layout = None
+            return result
+        counts = [scheduler_output.num_scheduled_tokens[rid] for rid in request_ids]
+        metadata = {rid: getattr(self.requests[rid], "additional_information_cpu", None) or {} for rid in request_ids}
+        self.model.cfg_pairing_layout = build_cfg_pairing_layout(
+            request_ids,
+            counts,
+            self.input_batch.num_computed_tokens_cpu[: len(request_ids)],
+            metadata,
+        )
+        self.model.cfg_guidance_layout = (
+            self.model.cfg_pairing_layout if any(info.get("use_cfg") is True for info in metadata.values()) else None
+        )
+        return result
+
+    def _request_needs_downstream_stage_payload(self, req_id):
+        # Suppress private branch postprocessing/payload construction. Scheduler
+        # filtering additionally protects terminal connector notifications.
+        if is_cfg_hidden_id(req_id):
+            return False
+        return super()._request_needs_downstream_stage_payload(req_id)
 
     def _update_streaming_request(self, req_id, new_req_data):
         payload = getattr(new_req_data, "additional_information", None)

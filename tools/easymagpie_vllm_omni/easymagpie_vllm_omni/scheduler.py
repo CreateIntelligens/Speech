@@ -334,9 +334,16 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
         if waiting_for_input:
             self.num_waiting_for_streaming_input -= 1
 
-        session.status = RequestStatus.RUNNING
-        if session not in self.running:
-            self.running.append(session)
+        if session.num_computed_tokens == 0:
+            # A text/phoneme warmup can finish a segment before emitting any
+            # codec frames. No worker request exists yet: the first real codec
+            # payload must take scheduled_new_reqs, not the cached-request path.
+            session.status = RequestStatus.WAITING
+            self.waiting.add_request(session)
+        else:
+            session.status = RequestStatus.RUNNING
+            if session not in self.running:
+                self.running.append(session)
         self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
 
     def update_from_output(self, scheduler_output, model_runner_output):

@@ -468,23 +468,27 @@ def test_native_codec_streaming_update_preserves_state_and_resumes_polling():
         (RequestStatus.WAITING_FOR_STREAMING_REQ, "skipped_waiting", 1),
     ],
 )
-def test_native_codec_segment_resume_stays_on_cached_request_path(status, queue_name, num_waiting):
+@pytest.mark.parametrize('computed_tokens', [0, 6])
+def test_native_codec_segment_resume_stays_on_cached_request_path(status, queue_name, num_waiting, computed_tokens):
     scheduler = object.__new__(EasyMagpieCodecScheduler)
     scheduler.chunk_transfer_adapter = SimpleNamespace(segment_finished_requests={"request"})
     scheduler.num_waiting_for_streaming_input = num_waiting
     scheduler.running = []
 
     class _RequestQueue(list):
+        def add_request(self, request):
+            self.append(request)
+
         def remove_requests(self, requests):
             for request in requests:
                 self.remove(request)
 
     session = SimpleNamespace(
         request_id="request",
-        prompt_token_ids=[0] * 6,
-        _all_token_ids=[0] * 6,
-        num_prompt_tokens=6,
-        num_computed_tokens=6,
+        prompt_token_ids=[0] * computed_tokens,
+        _all_token_ids=[0] * computed_tokens,
+        num_prompt_tokens=computed_tokens,
+        num_computed_tokens=computed_tokens,
         status=status,
     )
     scheduler.waiting = _RequestQueue()
@@ -493,13 +497,13 @@ def test_native_codec_segment_resume_stays_on_cached_request_path(status, queue_
 
     scheduler._resume_codec_after_segment(session)
 
-    assert scheduler.waiting == []
+    assert scheduler.waiting == ([] if computed_tokens else [session])
     assert scheduler.skipped_waiting == []
-    assert scheduler.running == [session]
-    assert session.status == RequestStatus.RUNNING
-    assert session.prompt_token_ids == [0] * 6
-    assert session._all_token_ids == [0] * 6
-    assert session.num_prompt_tokens == 6
-    assert session.num_computed_tokens == 6
+    assert scheduler.running == ([session] if computed_tokens else [])
+    assert session.status == (RequestStatus.RUNNING if computed_tokens else RequestStatus.WAITING)
+    assert session.prompt_token_ids == [0] * computed_tokens
+    assert session._all_token_ids == [0] * computed_tokens
+    assert session.num_prompt_tokens == computed_tokens
+    assert session.num_computed_tokens == computed_tokens
     assert scheduler.num_waiting_for_streaming_input == 0
     assert scheduler.chunk_transfer_adapter.segment_finished_requests == set()
