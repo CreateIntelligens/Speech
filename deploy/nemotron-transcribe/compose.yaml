@@ -1,0 +1,117 @@
+# Nemotron 3.5 Transcribe（vLLM + NeMo SpeechLM plugin），在這個目錄執行：
+#   docker compose build transcribe-api    # 先單獨 build 完（相依約 10 GB）
+#   docker compose up -d
+# 精度與記憶體比例由 entrypoint.sh 依 GPU 自動決定，x86_64 / aarch64 共用同一份。
+services:
+  # 宿主目錄不存在時 Docker 會以 root 建立，服務以宿主帳號執行就寫不進去；
+  # 這裡只把「root 擁有」的掛載點交給宿主帳號，本來就有主人的目錄不動。
+  transcribe-init:
+    image: nginx:1.31.7-alpine
+    restart: "no"
+    user: "0:0"
+    environment:
+      OWNER: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    command:
+      - sh
+      - -c
+      - 'for d in /models /cache; do [ "$$(stat -c %u $$d)" = 0 ] && chown "$$OWNER" $$d; done; true'
+    volumes:
+      - ${MODEL_HOST_DIR:-./models}:/models
+      - ./cache:/cache
+
+  transcribe-api:
+    depends_on:
+      transcribe-init:
+        condition: service_completed_successfully
+    build:
+      context: ../..
+      dockerfile: deploy/nemotron-transcribe/Dockerfile
+    image: nemotron-transcribe:local
+    container_name: nemotron-transcribe-api
+    restart: unless-stopped
+    init: true
+    # 以宿主帳號執行：模型與快取都是宿主目錄，避免留下 root 檔
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      MODEL_ROOT: /models
+      # auto：SM89 以上用 FP8，更舊的卡用 BF16；也可指定 bf16 / fp8 / nvfp4
+      MODEL_VARIANT: ${MODEL_VARIANT:-auto}
+      AUTO_DOWNLOAD: ${AUTO_DOWNLOAD:-1}
+      # 留空由 entrypoint 決定：統一記憶體（GB10）只給權重 + CACHE_GIB，獨立顯卡 0.90
+      GPU_MEMORY_UTILIZATION: ${GPU_MEMORY_UTILIZATION:-}
+      # 權重之外的 pool：vLLM 會用一段最長音檔（1 小時）量 encoder 尖峰，約 6.5 GiB，
+      # 剩下的才給 KV 與 Mamba 狀態（16 個並行約 1–2 GiB）
+      CACHE_GIB: ${CACHE_GIB:-9}
+      # 統一記憶體上啟動前要求「現在可用」≥ pool + 這個餘裕，否則拒絕啟動
+      HEADROOM_GIB: ${HEADROOM_GIB:-16}
+      # FlashInfer 第一次啟動要用 nvcc 現編 kernel，每個 cicc 吃 2–8 GB；
+      # 不設的話 ninja 開 nproc+2 個並行，2026-10-30 就是這樣把 GB10 吃到 OOM
+      MAX_JOBS: ${MAX_JOBS:-2}
+      # torch.compile 預設開 CPU 核數個編譯 worker，各自載入一份 torch；換設定（快取失效）時會一起湧上來
+      TORCHINDUCTOR_COMPILE_THREADS: ${TORCHINDUCTOR_COMPILE_THREADS:-2}
+      FLASHINFER_NVCC_THREADS: "1"
+      MAX_NUM_SEQS: ${MAX_NUM_SEQS:-16}
+      MAX_MODEL_LEN: ${MAX_MODEL_LEN:-65536}
+      NUM_SPECULATIVE_TOKENS: ${NUM_SPECULATIVE_TOKENS:-8}
+      SERVED_MODEL_NAME: ${SERVED_MODEL_NAME:-nemotron-transcribe}
+      VLLM_PLUGINS: nemo_speechlm
+      # 預設只收 10 分鐘 / 25 MB，模型可吃到 1 小時
+      VLLM_MAX_AUDIO_DECODE_DURATION_S: "3600"
+      VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: "180"
+      # CTC 字級時間戳只在 V1 model runner 上有
+      VLLM_USE_V2_MODEL_RUNNER: "0"
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      # FlashInfer / Triton / torch.compile 的 JIT 產物放進 /cache，重啟不必重編
+      HOME: /cache
+      XDG_CACHE_HOME: /cache
+      HF_HOME: /cache/huggingface
+      VLLM_CACHE_ROOT: /cache/vllm
+      # vLLM 的 compile 快取會引用 inductor 產的 cubin；預設在容器的 /tmp，重建容器就不見
+      TORCHINDUCTOR_CACHE_DIR: /cache/torchinductor
+      TRITON_CACHE_DIR: /cache/triton
+      # 統一記憶體機器：避免配置器碎片化後越撐越大
+      PYTORCH_ALLOC_CONF: expandable_segments:True
+    expose:
+      - "8000"
+    ipc: host
+    # 統一記憶體上 GPU 配置不算進 RSS，OOM killer 不會自己挑中 vLLM，
+    # 只會一路殺 sshd、桌面等小 process 直到整台失聯。指定這個容器第一個被殺：
+    # EngineCore 一死，它佔的 GPU pool 就整塊還回來。
+    oom_score_adj: 1000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # CDI 模式，與本機其他 GPU 服務一致
+            - driver: cdi
+              capabilities: [gpu]
+              device_ids:
+                - nvidia.com/gpu=all
+    volumes:
+      - ${MODEL_HOST_DIR:-./models}:/models
+      - ./cache:/cache
+      # 改啟動參數只要重啟容器，不必重 build
+      - ./entrypoint.sh:/usr/local/bin/entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # 首次啟動含下載模型與 FlashInfer JIT，可能要半小時以上
+      start_period: 3600s
+
+  transcribe-nginx:
+    image: nginx:1.31.7-alpine
+    container_name: nemotron-transcribe-nginx
+    restart: unless-stopped
+    depends_on:
+      - transcribe-api
+    ports:
+      - "${PUBLIC_PORT:-8804}:${PUBLIC_PORT:-8804}"
+    environment:
+      PUBLIC_PORT: ${PUBLIC_PORT:-8804}
+      UPSTREAM_HOST: transcribe-api
+      UPSTREAM_PORT: 8000
+      NGINX_ENVSUBST_FILTER: "^(PUBLIC_PORT|UPSTREAM_HOST|UPSTREAM_PORT)"
+    volumes:
+      - ./nginx.template:/etc/nginx/templates/default.conf.template:ro

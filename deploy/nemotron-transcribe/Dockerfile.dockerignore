@@ -1,0 +1,12 @@
+# 這份 Dockerfile 專用（BuildKit 會優先讀它而非根目錄的 .dockerignore）。
+# context 是整個 repo，模型目錄有 35 GB 以上，用白名單只送 build 需要的檔案。
+*
+!pyproject.toml
+!uv.lock
+!setup.py
+!README.md
+!LICENSE
+!nemo
+!deploy/nemotron-transcribe/entrypoint.sh
+**/__pycache__
+**/*.pyc

@@ -1,0 +1,8 @@
+models/
+cache/
+.env
+*.log
+testdata/
+qa/data/
+qa/results/
+__pycache__/
